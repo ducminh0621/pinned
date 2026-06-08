@@ -1,29 +1,41 @@
-FROM golang:1.18-alpine AS builder
-
+# ==================== Builder Stage ====================
+FROM golang:1.21 AS builder
 ENV PATH="/go/bin:${PATH}"
 ENV GO111MODULE=on
 ENV CGO_ENABLED=1
 ENV GOOS=linux
 ENV GOARCH=amd64
 
-WORKDIR /go/src
+WORKDIR /app
 
-COPY go.mod .
-COPY go.sum .
+# Copy dependency files first (better caching)
+COPY go.mod go.sum ./
 RUN go mod download
 
-RUN apk -U add ca-certificates
-RUN apk update && apk upgrade && apk add pkgconf git bash build-base sudo
-RUN git clone https://github.com/edenhill/librdkafka.git && cd librdkafka && ./configure --prefix /usr && make && make install
-
+# Copy the rest of the source code
 COPY . .
 
-RUN go build -tags musl --ldflags "-extldflags -static" -o main .
+# Build the binary (main.go is in root of each service)
+RUN CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
+    go build -ldflags="-s -w" -o main ./main.go
 
-FROM scratch AS runner
+# ==================== Production Stage ====================
+FROM debian:bookworm-slim
 
-COPY --from=builder /go/src/main /
+# Install minimal dependencies (especially librdkafka for Kafka)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    librdkafka1 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY --from=builder /app/main .
 
 EXPOSE 8080
 
-ENTRYPOINT ["./main", "all"]
+# Optional health check (change endpoint if your app uses different one)
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD curl -f http://localhost:8080/health || exit 1
+
+CMD ["./main"]
